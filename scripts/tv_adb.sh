@@ -1,231 +1,360 @@
 #!/bin/bash
-# 远程电视优化脚本（去广告/ 桌面管理 / 状态体检）
+# 安卓电视/盒子 ADB 远程工具箱
 #
-# 设计要点（均来自实战踩坑，勿删）：
-#  1. 所有操作前校验包名真实存在 —— 防止 pm disable 静默失败
-#  2. 只用 am force-stop —— pm disable-user/hide 在老机型上会被权限拒
-#  3. 每个动作后验证健康状态 —— 桌面焦点 + crashed 计数
-#  4. 所有 adb shell 输出接 tr -d '\r' —— Windows 行尾会破坏字符串比对
+# 适用：小米/小米盒子为主，其他品牌需替换包名（见 references/pkg-map-and-errors.md）
 #
 # 用法:
-#   bash tv_adb.sh probe    <IP>   # 体检：机型/权限边界/桌面健康
-#   bash tv_adb.sh deadbiz <IP>   # 去广告（force-stop 广告与冗余服务）
-#   bash tv_adb.sh status   <IP>   # 状态 + 健康检查
-#   bash tv_adb.sh restore  <IP>   # 恢复被停的服务
-#   bash tv_adb.sh launcher <IP>   # 桌面管理
+#   bash tv_adb.sh probe      <IP>              体检（机型/权限边界/桌面/内存）★首次必跑
+#   bash tv_adb.sh status     <IP>              状态查看
+#   bash tv_adb.sh deadbiz    <IP>              去广告
+#   bash tv_adb.sh install    <IP> <apk路径>    安装 APK（绕过广电合规拦截）
+#   bash tv_adb.sh launcher   <IP>              桌面管理（含特权分析）
+#   bash tv_adb.sh keep       <IP> [包名]       桌面保活（唤起指定桌面，默认当贝）
+#   bash tv_adb.sh power      <IP>              关机（等同遥控器电源键）
+#   bash tv_adb.sh brightness <IP> [0-255]      读取或设置亮度
+#   bash tv_adb.sh restore    <IP>              恢复被停用的服务
+#
+# 设计要点（全部来自实测踩坑，勿改）:
+#   1. macOS 无 timeout 命令 → 用后台作业 + 轮询实现超时
+#   2. 老电视 ps -A 只输出表头 → 用 dumpsys activity processes 判断进程
+#   3. 所有 adb shell 输出接 tr -d '\r'（否则字符串比对全失败）
+#   4. 包名操作前先校验存在性 → 防止静默失败（不报错 ≠ 生效）
 
 set -uo pipefail
 
-IP="${2:-}"
 ADB_DIR="$HOME/tools/android/platform-tools"
 [ -x "$ADB_DIR/adb" ] && export PATH="$ADB_DIR:$PATH"
 
-S="$IP:5555"
-run()   { adb -s "$S" shell "$@" 2>&1 | tr -d '\r'; }
-state() { adb -s "$S" get-state 2>&1 | tr -d '\r'; }
+CMD="${1:-}"
+IP="${2:-}"
+S="${IP}:5555"
 
-# 桌面健康：焦点窗口 + 崩溃计数
-check_health() {
-  local f c
-  f=$(run "dumpsys window windows" | grep mCurrentFocus | head -1)
-  c=$(run "logcat -d -b crash -t 30" | grep -ci 'FATAL')
-  case "$f" in
-    *tvhome*)    local d="原生桌面" ;;
-    *dangbei*)   local d="当贝桌面" ;;
-    *emotn*)     local d="Emotn 桌面" ;;
-    *screensaver*) local d="待机屏保（正常，非异常）" ;;
-    "")          local d="焦点未知" ;;
-    *)           local d="其他界面" ;;
-  esac
-  echo "  焦点: ${f:-无}"
-  echo "  判定: $d"
-  echo "  崩溃计数: $c$([ "$c" -gt 0 ] && echo '  ← 异常！需排查')"
+# ========== 基础工具 ==========
+
+# 超时执行（macOS 没有 timeout 命令）
+_runto() {
+  local sec="$1"; shift
+  local tmp; tmp=$(mktemp)
+  ( "$@" >"$tmp" 2>&1 ) &
+  local pid=$!
+  local waited=0
+  while kill -0 "$pid" 2>/dev/null; do
+    if [ "$waited" -ge "$sec" ]; then
+      kill -9 "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
+      cat "$tmp"; rm -f "$tmp"; return 124
+    fi
+    sleep 1; waited=$((waited + 1))
+  done
+  wait "$pid" 2>/dev/null
+  cat "$tmp"; rm -f "$tmp"
 }
 
+R()    { _runto 20 adb -s "$S" shell "$@" | tr -d '\r'; }
+die()  { echo "[FAIL] $*"; exit 1; }
+
 connect() {
-  [ -z "$IP" ] && { echo "[FAIL] 用法: bash $0 <子命令> <电视IP>"; exit 1; }
-  adb connect "$S" >/dev/null 2>&1
-  sleep 1
-  if [ "$(state)" != "device" ]; then
-    echo "[FAIL] 未连接到 $S"
-    echo "  检查: 1) 电视 ADB 调试已开（设置→账号与安全→ADB 调试）"
-    echo "        2) 电视与本机同局域网  3) 首次连接需在电视上点「始终允许」"
+  [ -z "$IP" ] && die "用法: bash tv_adb.sh ${CMD:-<命令>} <电视IP>"
+  _runto 15 adb connect "$S" >/dev/null 2>&1
+  sleep 2
+  local st
+  st=$(_runto 15 adb -s "$S" get-state 2>/dev/null | tr -d '\r')
+  if [ "$st" != "device" ]; then
+    echo "[FAIL] 未连接到 $S（状态: ${st:-无响应}）"
+    echo "  排查:"
+    echo "   1) 电视「设置 → 账号与安全 → ADB 调试」是否已开"
+    echo "   2) 首次连接需在电视上点「始终允许」授权框"
+    echo "   3) 电视与本机是否同一局域网"
+    echo "   4) 端口测试: nc -z -G 2 $IP 5555"
     exit 1
   fi
   echo "[OK] 已连接 $S"
 }
 
-exists()       { run pm list packages | grep -q "package:$1"; }
-stopped_flag() { run "dumpsys package $1" | grep -oE "stopped=(true|false)" | head -1 | cut -d= -f2; }
+exists()       { R pm list packages | grep -q "package:$1"; }
+# ★ 进程存活判断：老电视 ps -A 无输出，必须用 dumpsys
+proc_alive()   { R "dumpsys activity processes" | grep -q "$1"; }
+stopped_flag() { R "dumpsys package $1" | grep -oE "stopped=(true|false)" | head -1 | cut -d= -f2; }
+cur_focus()    { R "dumpsys window windows" | grep mCurrentFocus | sed 's/.*u0 //'; }
+crash_count()  { R 'logcat -d -b crash -t 30' | grep -ci FATAL; }
 
-case "${1:-}" in
+AD_PKGS=(
+  com.miui.systemAdSolution
+  com.miui.tv.analytics
+  com.xiaomi.statistic
+  com.xiaomi.mitv.tvpush.tvpushservice
+)
 
-probe)
+# ========== 子命令 ==========
+
+cmd_probe() {
   connect
   echo
   echo "=== 设备信息 ==="
-  echo "  型号: $(run getprop ro.product.model)"
-  echo "  Android: $(run getprop ro.build.version.release)  SDK: $(run getprop ro.build.version.sdk)"
-  echo "  固件: $(run getprop ro.build.version.incremental)"
-  echo "  内存: $(run 'grep MemTotal /proc/meminfo' | tr -s ' ')"
-  echo "  存储: $(run 'df -h /data' | tail -1 | tr -s ' ')"
-  echo "  包总数: $(run pm list packages | wc -l | tr -d ' ')"
+  echo "  型号     : $(R getprop ro.product.model)"
+  echo "  Android  : $(R getprop ro.build.version.release)  (SDK $(R getprop ro.build.version.sdk))"
+  echo "  固件     : $(R getprop ro.build.version.incremental)"
+  echo "  面板     : $(R getprop ro.boot.mi.panel_resolution)"
+  echo "  内存     : $(R 'grep MemTotal /proc/meminfo' | tr -s ' ')"
+  echo "  可用内存 : $(R 'grep MemAvailable /proc/meminfo' | tr -s ' ')"
+  echo "  存储     : $(R 'df -h /data' | tail -1 | tr -s ' ')"
+  echo "  包总数   : $(R pm list packages | wc -l | tr -d ' ')"
   echo
-  echo "=== 权限边界探测（决定用什么命令）==="
-  local_first=$(run pm list packages | head -1 | tr -d '\r')
-  tgt=$(run pm list packages | sed 's/package://' | grep -vE "^android|^com.android" | head -1)
-  echo "  测试包: ${tgt:-N/A}"
-  o=$(run "pm disable-user --user 0 $tgt" 2>&1)
-  if echo "$o" | grep -q "SecurityException"; then
-    echo "  pm disable-user : [不可用] 权限被拒 → 用 force-stop"
-  elif [ -z "$o" ]; then
-    echo "  pm disable-user : [可用]"
-    run "pm enable --user 0 $tgt" >/dev/null 2>&1
-  else
-    echo "  pm disable-user : [未知] $o"
-  fi
-  o=$(run "am force-stop $tgt" 2>&1)
-  [ -z "$o" ] && echo "  am force-stop  : [可用] ← 唯一推荐手段" || echo "  am force-stop  : [异常] $o"
-  echo "  root: $(run 'which su' 2>&1 | head -1)"
-  echo "  /system: $(run "mount | grep ' /system '" | tr -s ' ')"
-  echo
-  echo "=== 桌面健康 ==="
-  check_health
-  echo
-  echo "=== 候选桌面包名（供人工确认）==="
-  run pm list packages | sed 's/package://' | grep -iE "tvhome|launcher|dangbei|emotn|leanch|atv"
-  ;;
-
-deadbiz)
-  connect
-  echo
-  echo "=== 去广告：停用广告与冗余服务 ==="
-  echo "注意: force-stop 只是临时抑制 —— 被系统 bind 的服务包重启后会自动复活，需配 startup 做开机自启"
-  echo
-  # 格式: 包名|说明  —— bash 数组必须用 IFS 解析，不能用 ${item%%|*|（bash 3.2 错位）
-  LIST=(
-    "com.miui.systemAdSolution|系统广告服务（开机/桌面广告核心）"
-    "com.miui.tv.analytics|系统埋点统计"
-    "com.xiaomi.statistic|小米统计上报"
-    "com.xiaomi.mitv.tvpush.tvpushservice|电视推送（停后桌面推荐位可能不刷新）"
-    "com.xiaomi.gamecenter.sdk.service.mibox|游戏中心"
-    "com.xiaomi.mimusic2|小米音乐（不影响系统媒体框架）"
-    "com.mitv.screensaver|屏保"
-  )
-  for item in "${LIST[@]}"; do
-    IFS="|" read -r p desc <<< "$item"
-    if ! exists "$p"; then
-      echo "  [跳过] 未安装 ${p##*.}"
-      continue
-    fi
-    out=$(run am force-stop "$p")
-    if [ -z "$out" ]; then
-      echo "  [已停] ${p##*.}  ($desc)"
+  echo "=== 权限边界探测（决定能用哪些命令）==="
+  local tgt o
+  tgt=$(R pm list packages | sed 's/package://' | grep -vE '^android|^com\.android' | head -1)
+  if [ -n "$tgt" ]; then
+    o=$(R "pm disable-user --user 0 $tgt" 2>&1)
+    if echo "$o" | grep -q "SecurityException"; then
+      echo "  pm disable-user : [不可用] 权限被拒 → 改用 am force-stop"
+    elif [ -z "$o" ]; then
+      echo "  pm disable-user : [可用]"
+      R "pm enable --user 0 $tgt" >/dev/null 2>&1
     else
-      echo "  [ERR ] ${p##*.} -> $out"
+      echo "  pm disable-user : [未知] $o"
     fi
-  done
+    o=$(R "am force-stop $tgt" 2>&1)
+    if [ -z "$o" ]; then
+      echo "  am force-stop   : [可用] ← 唯一推荐手段"
+    else
+      echo "  am force-stop   : [异常] $o"
+    fi
+  fi
+  echo "  root            : $(R 'which su' 2>&1 | head -1)"
+  echo "  /system         : $(R "mount | grep ' /system '" | tr -s ' ' | cut -c1-60)"
   echo
-  echo "=== 桌面健康验证 ==="
-  sleep 2
-  check_health
+  echo "=== 桌面情况 ==="
+  echo "  当前焦点: $(cur_focus)"
+  echo "  候选桌面:"
+  R pm list packages | sed 's/package://' | grep -iE 'tvhome|launcher|dangbei|emotn|leanch' | sed 's/^/    /'
+  echo "  原生桌面特权标记:"
+  R "dumpsys package com.mitv.tvhome" 2>/dev/null | grep -oE 'privateFlags=\[[^]]*\]' | head -1 | sed 's/^/    /'
   echo
-  echo ">>> 立即生效。若要开机自动生效见 SKILL.md 的 startup 说明"
-  ;;
+  echo "=== 内存大户（前 12）==="
+  R "dumpsys meminfo" 2>/dev/null | sed -n '/Total PSS by process/,+13p' | tail -12 | sed 's/^/  /'
+}
 
-status)
+cmd_status() {
   connect
   echo
-  echo "=== 桌面健康 ==="
-  check_health
+  echo "=== 桌面状态 ==="
+  local f s
+  f=$(cur_focus)
+  echo "  当前焦点: ${f:-未知}"
+  case "$f" in
+    *dangbei*)     echo "  → 当贝桌面" ;;
+    *tvhome*)      echo "  → 小米原生桌面" ;;
+    *screensaver*) echo "  → 待机屏保（正常）" ;;
+    "")            echo "  → 焦点未知" ;;
+    *)             echo "  → 其他界面" ;;
+  esac
+  echo "  原生 stopped : $(stopped_flag com.mitv.tvhome)  （false = 正常）"
+  echo "  崩溃计数     : $(crash_count)"
+  echo "  永久禁用清单 : $(R 'pm list packages -d' | tr '\n' ' ')"
   echo
   echo "=== 广告服务状态 ==="
-  printf "  %-26s %-10s %s\n" "包名" "状态" "说明"
-  printf "  %-26s %-10s %s\n" "--------------------------" "----------" "----"
-  LIST=(
-    "com.miui.systemAdSolution|开机/桌面广告"
-    "com.miui.tv.analytics|埋点统计"
-    "com.xiaomi.statistic|统计上报"
-    "com.xiaomi.mitv.tvpush.tvpushservice|推送服务"
-    "com.xiaomi.gamecenter.sdk.service.mibox|游戏中心"
-    "com.xiaomi.mimusic2|小米音乐"
-  )
-  for item in "${LIST[@]}"; do
-    IFS="|" read -r p desc <<< "$item"
-    if ! exists "$p"; then
-      printf "  %-26s %-10s %s\n" "${p##*.}" "未装" "$desc"; continue
-    fi
-    if [ "$(stopped_flag "$p")" = "true" ]; then m="[已停]"; else m="[运行]"; fi
-    printf "  %-26s %-10s %s\n" "${p##*.}" "$m" "$desc"
+  printf "  %-36s %s\n" "包名" "状态"
+  for p in "${AD_PKGS[@]}" com.xiaomi.mitv.upgrade; do
+    if ! exists "$p"; then printf "  %-36s %s\n" "${p##*.}" "未安装"; continue; fi
+    s=$(stopped_flag "$p")
+    if [ "$s" = "true" ]; then printf "  %-36s %s\n" "${p##*.}" "[已停]"
+    else printf "  %-36s %s\n" "${p##*.}" "[运行]"; fi
   done
   echo
-  echo "=== 桌面应用安装情况 ==="
-  run pm list packages | sed 's/package://' | grep -iE "tvhome|launcher|dangbei|emotn"
-  ;;
+  echo "=== 亮度 ==="
+  echo "  $(R 'settings get system screen_brightness') / 255"
+}
 
-restore)
+cmd_deadbiz() {
   connect
   echo
-  echo "=== 恢复被停的服务 ==="
-  echo "方式: 显式启动 service 清除 stopped 标志（不删数据、不改系统）"
+  echo "=== 去广告（force-stop）==="
+  echo "注意: force-stop 是会话内临时抑制。被系统 bind 的服务包（广告/统计/推送）"
+  echo "      会在重启或运行一段时间后被自动拉起，需要时重跑本命令。"
   echo
-  LIST=(
-    "com.miui.systemAdSolution|"
-    "com.miui.tv.analytics|"
-    "com.xiaomi.statistic|"
-    "com.xiaomi.mitv.tvpush.tvpushservice|"
-    "com.xiaomi.gamecenter.sdk.service.mibox|"
-    "com.xiaomi.mimusic2|"
-  )
-  for item in "${LIST[@]}"; do
-    IFS="|" read -r p _ <<< "$item"
-    exists "$p" || continue
-    if [ "$(stopped_flag "$p")" != "true" ]; then
-      echo "  [跳过] ${p##*.} 未被停"; continue
+  local p o
+  for p in "${AD_PKGS[@]}"; do
+    if ! exists "$p"; then echo "  [跳过] 未安装 ${p##*.}"; continue; fi
+    o=$(R am force-stop "$p")
+    if [ -z "$o" ]; then echo "  [已停] ${p##*.}"
+    else echo "  [ERR ] ${p##*.} -> $o"; fi
+  done
+  echo
+  echo "=== 健康验证 ==="
+  sleep 2
+  echo "  桌面停止标志: $(stopped_flag com.mitv.tvhome)  （应为 false）"
+  echo "  崩溃计数    : $(crash_count)"
+}
+
+cmd_install() {
+  local apk="${3:-}"
+  [ -z "$apk" ] && die "用法: bash tv_adb.sh install <IP> <apk路径>"
+  [ -f "$apk" ] || die "APK 不存在: $apk"
+  connect
+  echo
+  echo "=== 校验 APK ==="
+  file "$apk" | sed 's/^/  /'
+  echo "  SHA256: $(shasum -a 256 "$apk" | cut -d' ' -f1)"
+  echo
+  echo "=== 推送 ==="
+  _runto 300 adb -s "$S" push "$apk" /data/local/tmp/_install.apk 2>&1 | tail -1
+  echo
+  echo "=== 安装（走 shell 通道，绕过广电合规拦截）==="
+  R "pm install -r /data/local/tmp/_install.apk"
+  echo
+  echo "=== 清理 ==="
+  R "rm -f /data/local/tmp/_install.apk"
+  echo "  已清理"
+}
+
+cmd_launcher() {
+  connect
+  echo
+  echo "=== 桌面候选 ==="
+  R pm list packages | sed 's/package://' | grep -iE 'tvhome|launcher|dangbei|emotn' | sed 's/^/  /'
+  echo
+  echo "=== 当前焦点 ==="
+  echo "  $(cur_focus)"
+  echo
+  echo "=== 为何无法设置系统默认桌面 ==="
+  echo "  原生桌面标记: $(R 'dumpsys package com.mitv.tvhome' | grep -oE 'privateFlags=\[[^]]*\]' | head -1)"
+  echo
+  echo "  原因链:"
+  echo "   1) 原生桌面是 PRIVILEGED 特权应用 → HOME 意图永远优先选它"
+  echo "   2) Android 6.0 无 pm set-home-activity 命令（Oreo 才加）"
+  echo "   3) pm disable/hide 原生桌面 → 权限被拒（缺 MANAGE_USERS）"
+  echo "   4) 无 root → 改不了 /data/system 下的 preferred-activities"
+  echo
+  echo "  可行解:"
+  echo "   - 第三方桌面靠自带 HomeKeyEventCatchService 抢 HOME 键"
+  echo "   - 关键在【保住它进程存活】，而不是压制原生桌面"
+  echo
+  echo "  唤起当贝: bash tv_adb.sh keep $IP"
+}
+
+cmd_keep() {
+  local pkg="${3:-com.dangbei.tvlauncher}"
+  local main="${4:-}"
+  if [ -z "$main" ]; then
+    case "$pkg" in
+      com.dangbei.tvlauncher) main="com.dangbei.launcher.ui.main.MainActivity" ;;
+      *) main=$(R "dumpsys package $pkg" | grep -A2 'android.intent.action.MAIN' | grep -oE "$pkg/[A-Za-z0-9_.]+" | head -1 | cut -d/ -f2) ;;
+    esac
+  fi
+  connect
+  echo
+  if proc_alive "$pkg"; then
+    echo "  [存活] $pkg 已在运行"
+  else
+    echo "  [唤起] $pkg 未运行，正在启动..."
+    R "am start -n $pkg/$main" >/dev/null 2>&1
+    sleep 3
+    if proc_alive "$pkg"; then
+      echo "  [OK] 已拉起"
+    else
+      echo "  [WARN] 拉不起来。检查包名与 Activity:"
+      echo "     $pkg/$main"
     fi
-    svc=$(run "dumpsys package $p" | grep -oE "$p/[A-Za-z0-9_.$]*Service" | head -1)
-    if [ -n "$svc" ]; then
-      run am startservice -n "$svc" >/dev/null 2>&1
+  fi
+  echo
+  echo "  当前焦点: $(cur_focus)"
+}
+
+cmd_power() {
+  connect
+  echo
+  echo "=== 关机（电源键，等同遥控器）==="
+  echo "  注: 彻底关机 ACTION_REQUEST_SHUTDOWN 需 android.permission.SHUTDOWN，"
+  echo "      普通 shell 没有权限，只能用电源键。"
+  R input keyevent KEYCODE_POWER
+  sleep 3
+  echo -n "  验证中... "
+  local st
+  st=$(_runto 10 adb -s "$S" get-state 2>/dev/null | tr -d '\r')
+  if [ "$st" = "device" ]; then
+    echo "仍在线（可能只是熄屏）"
+  else
+    echo "[OK] 已断开 → 关机成功"
+  fi
+}
+
+cmd_brightness() {
+  connect
+  local val="${3:-}"
+  if [ -z "$val" ]; then
+    echo "  当前亮度: $(R 'settings get system screen_brightness') / 255"
+  else
+    case "$val" in *[!0-9]*) die "亮度必须是整数";; esac
+    if [ "$val" -lt 0 ] || [ "$val" -gt 255 ]; then
+      die "亮度超范围（0-255）"
     fi
+    echo "  原值: $(R 'settings get system screen_brightness')"
+    R "settings put system screen_brightness $val"
     sleep 1
+    echo "  新值: $(R 'settings get system screen_brightness')"
+  fi
+  echo
+  echo "  提示: 对比度/色温/锐度/降噪等画质参数不在 Android 层，"
+  echo "        由芯片 tvserver 的 PQ 模块管理，adb 读不到也改不了，"
+  echo "        必须用遥控器在电视「设置 → 图像与声音」里调。"
+}
+
+cmd_restore() {
+  connect
+  echo
+  echo "=== 恢复被停用的服务 ==="
+  local p s svc
+  for p in "${AD_PKGS[@]}"; do
+    exists "$p" || continue
+    s=$(stopped_flag "$p")
+    if [ "$s" != "true" ]; then
+      echo "  [跳过] ${p##*.} 未被停"
+      continue
+    fi
+    svc=$(R "dumpsys package $p" | grep -oE "$p/[A-Za-z0-9_.\$]*Service" | head -1 | cut -d/ -f2)
+    if [ -n "$svc" ]; then
+      R "am startservice -n $p/$svc" >/dev/null 2>&1
+      sleep 1
+    fi
     if [ "$(stopped_flag "$p")" = "false" ]; then
       echo "  [已恢复] ${p##*.}"
     else
-      echo "  [需手动] ${p##*.} —— 在电视上打开该应用一次即恢复"
+      echo "  [需手动] ${p##*.} — 在电视上打开该应用一次即可"
     fi
   done
-  echo
-  echo ">>> 显示[需手动]的，在电视桌面找到该应用点开一次即可。"
-  echo ">>> 兜底: 设置 → 系统 → 恢复出厂设置（会清数据，慎用）"
-  ;;
+}
 
-launcher)
-  connect
-  echo
-  echo "=== 桌面应用 ==="
-  run pm list packages | sed 's/package://' | grep -iE "tvhome|launcher|dangbei|emotn"
-  echo
-  echo "=== 当前桌面 ==="
-  check_health
-  echo
-  echo "=== 可用操作 ==="
-  echo "  切回小米原生桌面:"
-  echo "    adb -s $S shell am start -n com.mitv.tvhome/com.mitv.tvhome.MainActivityUserMode"
-  echo
-  echo "  彻底卸载第三方桌面（-k 保留数据）:"
-  echo "    adb -s $S shell pm uninstall -k --user 0 <桌面包名>"
-  echo
-  echo "  说明: Android 6.0 无 pm set-home-activity 命令（Oreo 才加）"
-  echo "        多数桌面靠 BootReceiver + HomeKeyEventCatchService 自抢占"
-  ;;
+# ========== 入口 ==========
 
-*)
-  echo "用法: bash $0 <子命令> <电视IP>"
-  echo
-  echo "  probe    <IP>   体检：机型/权限边界/桌面健康（首次必跑）"
-  echo "  deadbiz <IP>   去广告（force-stop 广告与冗余服务）"
-  echo "  status   <IP>   状态 + 健康检查"
-  echo "  restore  <IP>   恢复被停的服务"
-  echo "  launcher <IP>   桌面管理"
-  ;;
+case "$CMD" in
+  probe)      cmd_probe ;;
+  status)     cmd_status ;;
+  deadbiz)    cmd_deadbiz ;;
+  install)    cmd_install ;;
+  launcher)   cmd_launcher ;;
+  keep)       cmd_keep ;;
+  power)      cmd_power ;;
+  brightness) cmd_brightness ;;
+  restore)    cmd_restore ;;
+  *)
+    cat <<'USAGE'
+安卓电视 ADB 远程工具箱
+
+用法: bash tv_adb.sh <命令> <电视IP> [参数]
+
+  probe      <IP>              体检（机型/权限边界/桌面/内存）★首次必跑
+  status     <IP>              状态查看
+  deadbiz    <IP>              去广告
+  install    <IP> <apk路径>    安装 APK（绕过广电合规拦截）
+  launcher   <IP>              桌面管理（含特权分析）
+  keep       <IP> [包名]       桌面保活（唤起指定桌面，默认当贝）
+  power      <IP>              关机
+  brightness <IP> [0-255]      读取/设置亮度
+  restore    <IP>              恢复被停用的服务
+
+依赖 adb（platform-tools）。未安装时：
+  mkdir -p ~/tools/android && cd ~/tools/android && \
+  curl -L -o pt.zip https://dl.google.com/android/repository/platform-tools-latest-darwin.zip && \
+  unzip -q pt.zip
+USAGE
+    ;;
 esac

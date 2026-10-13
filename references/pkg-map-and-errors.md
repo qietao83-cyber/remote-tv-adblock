@@ -133,6 +133,88 @@ Error: unknown command 'set-home-activity'
 **解决**：`adb shell pm install -r <apk>` ——走 shell 通道，绕过该 action。
 **禁止**：停用 `com.mitv.care`（合规 + 广告双用组件）。
 
+### SecurityException: requires HOME_STATE
+
+```
+SecurityException: starting Intent { cmp=com.mitv.tvhome/.MainActivityUserMode }
+from null (pid=x, uid=2000) requires com.mitv.tvhome.permission.HOME_STATE
+```
+**含义**：小米给原生桌面 MainActivity 加了专属权限，**shell 启动不了它**。
+**影响**：应急回退**不能靠 adb 启动原生桌面**，只能按遥控器 HOME 键。
+**注意**：这条错误同时暴露了「系统当前认定的默认桌面是谁」——若报的是 tvhome，说明特权桌面优先。
+
+### SecurityException: requires SHUTDOWN
+
+```
+SecurityException: starting Intent { act=android.intent.action.ACTION_REQUEST_SHUTDOWN }
+requires android.permission.SHUTDOWN
+```
+**含义**：彻底关机需系统权限，普通 shell 没有。
+**解决**：用 `adb shell input keyevent KEYCODE_POWER`（等同遥控器电源键）。
+
+### unknown command 'clear-package-preferred-activities'
+
+**含义**：Android 6.0 无此命令（与 `set-home-activity` 一样是 Oreo+ 才有）。
+**解决**：见 SKILL.md「桌面管理与保活」——改走保活策略。
+
+### ps 输出只有表头
+
+```
+$ adb shell "ps -A"
+USER  PID  PPID  VSIZE  RSS  WCHAN  PC  NAME      ← 没有后续行
+```
+**含义**：老 Android 的 shell 权限限制，**`ps` 看不到任何进程**。
+**后果**：`ps -A | grep -c <包名>` 恒为 0，**用它判断进程存活会全部误判**。
+**解决**：改用 `dumpsys activity processes | grep -c <包名>`。
+
+### 只有表头 / 连接反复 offline
+
+```
+failed to connect to <IP>:5555
+List of devices attached
+<IP>:5555    offline
+```
+**含义**（按可能性排序）：
+1. **电视上正弹授权框没人点** → 让用户点「始终允许」
+2. adbd 卡死 → 重启电视
+3. 换过 WiFi 后需重新授权 → 重启 adbd 或电视
+
+**判断是否真关机**：`ping` 不通 + `5555/8009/80` 全 closed + mDNS 消失。
+
+---
+
+## 六、macOS 本机环境坑（写脚本必看）
+
+| 坑 | 现象 | 解决 |
+|---|---|---|
+| **无 `timeout`** | `timeout: command not found` | 后台作业 + 轮询 kill |
+| **无 `flock`** | `flock: command not found` | `mkdir` 原子锁 + PID 自愈 |
+| **cron 默认不跑** | `crontab -l` 有内容但日志不动 | `sudo launchctl load -w /System/Library/LaunchDaemons/com.vix.cron.plist` |
+| **launchctl load 已废弃** | `Load failed: 5: Input/output error` | 用 `launchctl bootstrap gui/$(id -u) <plist>` |
+| **沙箱内装不了定时任务** | `crontab: Operation not permitted` | 必须让用户在终端执行 |
+
+---
+
+## 七、桌面特权判断（决定能否设默认桌面）
+
+```bash
+adb shell "dumpsys package <桌面包名>" | grep -oE "flags=\[[^]]*\]|privateFlags=\[[^]]*\]"
+```
+
+| 输出特征 | 含义 |
+|---|---|
+| `privateFlags=[PRIVILEGED]` + `flags=[SYSTEM ...]` | **特权系统应用** → HOME 意图永远优先 |
+| `flags=[DEBUGGABLE ...]`（无 SYSTEM） | 普通用户应用 → 抢不过特权应用 |
+
+**实测对照**（MiTV4-ANSM0）：
+```
+com.mitv.tvhome         flags=[SYSTEM ... UPDATED_SYSTEM_APP] privateFlags=[PRIVILEGED]
+com.dangbei.tvlauncher  flags=[DEBUGGABLE ...]                ← 无特权
+```
+两者都在 `/data/app`，但原生桌面保留系统身份（预装后被更新到 /data 的情况）。
+
+**结论**：无 root 改不了默认桌面，只能靠第三方桌面的 `HomeKeyEventCatchService` + 保活。
+
 ### /system/bin/sh: su: not found
 
 无 root。`/system` 通常挂载为 `ro`（只读）。别尝试 remount。
