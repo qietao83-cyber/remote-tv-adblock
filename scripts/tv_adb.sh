@@ -100,7 +100,7 @@ deadbiz)
   connect
   echo
   echo "=== 去广告：停用广告与冗余服务 ==="
-  echo "注意: force-stop 置 stopped 标志，重启电视不会自动解除"
+  echo "注意: force-stop 只是临时抑制 —— 被系统 bind 的服务包重启后会自动复活，需配 startup 做开机自启"
   echo
   # 格式: 包名|说明  —— bash 数组必须用 IFS 解析，不能用 ${item%%|*|（bash 3.2 错位）
   LIST=(

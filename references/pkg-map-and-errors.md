@@ -179,9 +179,18 @@ adb shell pm list packages -d
 
 | 场景 | 表现 | 恢复方式 |
 |---|---|---|
-| force-stop 系统包 | `stopped=true`，重启不恢复 | `am startservice -n <pkg>/<Service>` 或电视上打开该应用 |
-| 被系统 bind | `stopped` 自动变 false，服务照常运行 | 无需恢复（说明无强依赖） |
+| force-stop 服务类包（被 system bind） | 重启后 `stopped` 自动变 false，服务复活 | 无需恢复（系统自己拉起）——**所以必须配开机自启** |
+| force-stop 非依赖包 | `stopped=true` 保留，重启后仍停 | `am startservice -n <pkg>/<Service>` 或电视上打开该应用 |
 | 桌面停用（disable-user） | 图标消失，`enabled=false` | `pm enable --user 0 <pkg>` |
 | 万能兜底 | — | 恢复出厂设置（**会清数据**） |
 
 ⚠️ Android 6.0 上命令是 `am startservice`，`am start-service` 是 Oreo 才有的写法。
+
+⚠️ **「重启就能恢复」是个误导说法**：重启只是让系统顺带把服务 bind 回来，**不等于解除停止状态**。要主动清除 stopped，必须启动该包任一组件。
+
+### 小米电视重启后的两件事
+
+1. **广告服务复活**（被 bind 的那批）→ 重跑 `tv_adb.sh deadbiz`
+2. **ADB 调试自动关闭** → 电视上手动重开
+
+**快速诊断**：`5555/8009/8008/8080/80` 全部关闭 → 系统重启过。

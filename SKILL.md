@@ -133,26 +133,60 @@ sleep 4; adb shell "dumpsys window windows" | grep mCurrentFocus
 
 ## 关键机制（★ 最容易搞错，必读）
 
-### force-stop ≠ 禁用，且「重启」不能恢复
+### force-stop ≠ 禁用，且重启后大概率自动恢复
 
-`am force-stop` 的真实语义 = **杀进程 + 在 packages.xml 置 `stopped="true"`**，该标志**跨重启保留**。
+`am force-stop` = **杀进程 + 置 `stopped="true"` 标志**。但这个标志**并非一律跨重启保留**——实测（MiTV4-ANSM0）：
+
+| 包类型 | 重启后 | 原因 |
+|---|---|---|
+| **提供 Binder 服务的包**（广告服务、统计、推送） | ❌ stopped 被清除，**服务自动拉起** | system_server 启动时会 bind 它们，**绑定动作即清 stopped** |
+| **不被系统依赖的包**（游戏中心、小米音乐） | ✅ stopped=true **保留，仍停** | 无 bind 方，没人拉起 |
+
+> **实测验证命令**：
+> ```bash
+> adb shell "dumpsys package <pkg>" | grep -oE "stopped=(true|false)"
+> ```
+> 重启前后各跑一次即可确认。
+
+**正确结论**：
+> force-stop 是**「本次会话内」的临时抑制，不是持久禁用**。
+> 停广告前先想清楚：**目标包是不是被系统 bind 的服务包？** 是的话，重启后必然复活，stop 只能管到下次重启。
+> **要持久，必须配开机自启**（见 `startup`）。
 
 | | force-stop | pm disable-user |
 |---|---|---|
 | `enabled` 状态 | 保持 enabled | 改为 DISABLED_USER |
-| 跨重启 | **stopped 标志保留** | enabled 状态保留 |
+| 重启后 | **视是否被 bind 而定** | 保持禁用 |
 | 桌面图标 | 正常可见 | 消失 |
 | 恢复方式 | **启动任一组件即自动清除 stopped** | `pm enable` |
 
-⚠️ **「重启电视就恢复了」是错的。** 重启后服务仍不自动拉起（收不到 `BOOT_COMPLETED`）。恢复方式：
-```bash
-adb shell am startservice -n <pkg>/<任一Service>   # Android 6.0 是 startservice，非 start-service
+⚠️ **恢复方式永远是「启动该包任一组件」**（`am startservice` 或电视上手动打开），**不是「重启」**。重启只会让系统顺带恢复它，不算「解除」。
+
+### 包被 bind 会自动复活（★这是重启后广告复现的根因）
+
+提供 Binder 服务的包会被系统自己 bind 拉起，`stopped` 被清除并照常运行。
+
+**实测证据**（MiTV4-ANSM0 重启后）：
 ```
-或在电视上手动打开该应用一次。兜底：恢复出厂设置（**会清数据，慎用**）。
+com.miui.systemAdSolution     stopped=false  ← 被拉回
+com.miui.tv.analytics         stopped=false  ← 被拉回
+com.xiaomi.statistic          stopped=false  ← 被拉回
+com.xiaomi.mitv.tvpush...     stopped=false  ← 被拉回
+com.xiaomi.gamecenter...mibox stopped=true   ← 保留
+com.xiaomi.mimusic2           stopped=true   ← 保留
+```
 
-### 包被 bind 会自动复活
+**所以停广告必须配开机自启**，否则每次重启都要手动重来。
 
-提供 Binder 服务的包（analytics、statistic 类）会被系统自己 bind 拉起，`stopped` 被清除并照常运行。**所以某些 force-stop 是无效操作**——这既是风险归零的信号，也是「广告没去掉」的信号。用 `dumpsys package <pkg> | grep stopped` 验证，别凭感觉。
+### 小米电视重启会连带断掉远程能力
+
+重启后：
+1. 广告服务复活（被 bind 的那些）
+2. **ADB 调试自动关闭** → 需到电视上手动重开
+
+**快速指纹**：电视在线但 5555/8009/8008/8080/80 **全部 refused/closed** → 判断"系统重启过"（正常待机时 5555 是开的）。
+
+→ 这也是为什么 `startup` 自启很关键：不配的话，重启一次就得手动补救两件事（开 ADB + 重跑 stop）。
 
 ### 包名跨机型不通用
 
